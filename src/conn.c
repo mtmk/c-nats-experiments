@@ -301,6 +301,10 @@ natsConn_bufferFlush(natsConnection *nc)
 natsStatus
 natsConn_bufferWrite(natsConnection *nc, const char *buffer, int len)
 {
+    // XXX
+    //printf(">>> Buffer Write\n");
+    //ne_dump_buffer(buffer, len);
+
     natsStatus  s = NATS_OK;
     int         offset = 0;
     int         avail  = 0;
@@ -482,14 +486,20 @@ natsConn_isDrainingPubs(natsConnection *nc)
 static natsStatus
 _readOp(natsConnection *nc, natsControl *control)
 {
+    // XXX
+    //printf(">>> Read Op\n");
+
     natsStatus  s = NATS_OK;
     char        buffer[MAX_INFO_MESSAGE_SIZE];
 
     buffer[0] = '\0';
 
     s = natsSock_ReadLine(&(nc->sockCtx), buffer, sizeof(buffer));
-    if (s == NATS_OK)
+    if (s == NATS_OK) {
+        // XXX
+        //ne_dump_buffer(buffer, strlen(buffer));
         s = nats_ParseControl(control, buffer);
+    }
 
     return NATS_UPDATE_ERR_STACK(s);
 }

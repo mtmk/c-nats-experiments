@@ -28,6 +28,9 @@ int main(void)
 
     printf("rtt: %lld\n", rtt);
 
+    s = natsConnection_Publish(conn, "foo", (const void *)"hello", 5);
+    if (s != NATS_OK) goto error;
+
     printf("cleanup\n");
     natsConnection_Destroy(conn);
     natsOptions_Destroy(opts);

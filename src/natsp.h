@@ -14,6 +14,8 @@
 #ifndef NATSP_H_
 #define NATSP_H_
 
+#include "nats_experiments.h"
+
 #if defined(_WIN32)
 # include "include/n-win.h"
 #else

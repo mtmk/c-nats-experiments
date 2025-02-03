@@ -22,19 +22,6 @@
 # include "include/n-unix.h"
 #endif
 
-#if defined(NATS_HAS_TLS)
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/x509v3.h>
-#include <openssl/rand.h>
-#else
-#define SSL             void*
-#define SSL_free(c)     { (c) = NULL; }
-#define SSL_CTX         void*
-#define SSL_CTX_free(c) { (c) = NULL; }
-#define NO_SSL_ERR  "The library was built without SSL support!"
-#endif
-
 #include "err.h"
 #include "nats.h"
 #include "buf.h"
@@ -182,18 +169,6 @@ typedef struct __natsServerInfo
 
 } natsServerInfo;
 
-typedef struct __natsSSLCtx
-{
-    natsMutex   *lock;
-    int         refs;
-    SSL_CTX     *ctx;
-    char        *expectedHostname;
-    bool        skipVerify;
-
-} natsSSLCtx;
-
-#define natsSSLCtx_getExpectedHostname(ctx) ((ctx)->expectedHostname)
-
 typedef struct
 {
     natsEvLoop_Attach           attach;
@@ -271,8 +246,6 @@ struct __natsOptions
     int                     maxPendingMsgs;
     int64_t                 maxPendingBytes;
 
-    natsSSLCtx              *sslCtx;
-
     void                    *evLoop;
     natsEvLoopCallbacks     evCbs;
 
@@ -331,7 +304,6 @@ struct __natsOptions
 
     // Reconnect jitter added to reconnect wait
     int64_t                 reconnectJitter;
-    int64_t                 reconnectJitterTLS;
 
     // Custom handler to specify reconnect wait time.
     natsCustomReconnectDelayHandler customReconnectDelayCB;
@@ -648,8 +620,6 @@ typedef struct __natsSockCtx
     natsDeadline    readDeadline;
     natsDeadline    writeDeadline;
 
-    SSL             *ssl;
-
     // This is true when we are using an external event loop (such as libuv).
     bool            useEventLoop;
 
@@ -773,9 +743,6 @@ struct __natsConnection
         int             up;
     } srvVersion;
 };
-
-void
-nats_sslRegisterThreadForCleanup(void);
 
 void
 nats_setNATSThreadKey(void);

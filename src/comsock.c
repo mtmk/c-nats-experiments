@@ -406,12 +406,7 @@ natsSock_Read(natsSockCtx *ctx, char *buffer, size_t maxBufferSize, int *n)
 
     while (needRead)
     {
-#if defined(NATS_HAS_TLS)
-        if (ctx->ssl != NULL)
-            readBytes = SSL_read(ctx->ssl, buffer, (int) maxBufferSize);
-        else
-#endif
-            readBytes = recv(ctx->fd, buffer, (natsRecvLen) maxBufferSize, 0);
+         readBytes = recv(ctx->fd, buffer, (natsRecvLen) maxBufferSize, 0);
 
         if (readBytes == 0)
         {
@@ -419,39 +414,10 @@ natsSock_Read(natsSockCtx *ctx, char *buffer, size_t maxBufferSize, int *n)
         }
         else if (readBytes < 0)
         {
-#if defined(NATS_HAS_TLS)
-            if (ctx->ssl != NULL)
-            {
-                int sslErr = SSL_get_error(ctx->ssl, readBytes);
-
-                if (sslErr == SSL_ERROR_ZERO_RETURN)
-                    return nats_setDefaultError(NATS_CONNECTION_CLOSED);
-
-                if ((sslErr == SSL_ERROR_WANT_READ) || (sslErr == SSL_ERROR_WANT_WRITE))
-                {
-                    int waitMode = (sslErr == SSL_ERROR_WANT_READ ? WAIT_FOR_READ : WAIT_FOR_WRITE);
-
-                    if ((s = natsSock_WaitReady(waitMode, ctx)) != NATS_OK)
-                        return NATS_UPDATE_ERR_STACK(s);
-
-                    // SSL requires that we go back with the same buffer
-                    // and size. We can't return until SSL_read returns
-                    // success (bytes read) or a different error.
-                    continue;
-                }
-            }
-#endif
-
             if (NATS_SOCK_GET_ERROR != NATS_SOCK_WOULD_BLOCK)
             {
-#if defined(NATS_HAS_TLS)
-                if (ctx->ssl != NULL)
-                    return nats_setError(NATS_IO_ERROR, "SSL_read error: %s",
-                                        NATS_SSL_ERR_REASON_STRING);
-                else
-#endif
-                    return nats_setError(NATS_IO_ERROR, "recv error: %d",
-                                        NATS_SOCK_GET_ERROR);
+                return nats_setError(NATS_IO_ERROR, "recv error: %d",
+                                     NATS_SOCK_GET_ERROR);
             }
             else if (ctx->useEventLoop)
             {
@@ -490,15 +456,10 @@ natsSock_Write(natsSockCtx *ctx, const char *data, int len, int *n)
 
     while (needWrite)
     {
-#if defined(NATS_HAS_TLS)
-        if (ctx->ssl != NULL)
-            bytes = SSL_write(ctx->ssl, data, len);
-        else
-#endif
 #ifdef MSG_NOSIGNAL
-            bytes = send(ctx->fd, data, len, MSG_NOSIGNAL);
+        bytes = send(ctx->fd, data, len, MSG_NOSIGNAL);
 #else
-            bytes = send(ctx->fd, data, len, 0);
+        bytes = send(ctx->fd, data, len, 0);
 #endif
 
         if (bytes == 0)
@@ -507,39 +468,10 @@ natsSock_Write(natsSockCtx *ctx, const char *data, int len, int *n)
         }
         else if (bytes < 0)
         {
-#if defined(NATS_HAS_TLS)
-            if (ctx->ssl != NULL)
-            {
-                int sslErr = SSL_get_error(ctx->ssl, bytes);
-
-                if (sslErr == SSL_ERROR_ZERO_RETURN)
-                    return nats_setDefaultError(NATS_CONNECTION_CLOSED);
-
-                if ((sslErr == SSL_ERROR_WANT_READ) || (sslErr == SSL_ERROR_WANT_WRITE))
-                {
-                    int waitMode = (sslErr == SSL_ERROR_WANT_READ ? WAIT_FOR_READ : WAIT_FOR_WRITE);
-
-                    if ((s = natsSock_WaitReady(waitMode, ctx)) != NATS_OK)
-                        return NATS_UPDATE_ERR_STACK(s);
-
-                    // SSL requires that we go back with the same buffer
-                    // and size. We can't return until SSL_write returns
-                    // success (bytes written) or a different error.
-                    continue;
-                }
-            }
-#endif
-
             if (NATS_SOCK_GET_ERROR != NATS_SOCK_WOULD_BLOCK)
             {
-#if defined(NATS_HAS_TLS)
-                if (ctx->ssl != NULL)
-                    return nats_setError(NATS_IO_ERROR, "SSL_write error: %s",
-                                         NATS_SSL_ERR_REASON_STRING);
-                else
-#endif
-                    return nats_setError(NATS_IO_ERROR, "send error: %d",
-                                         NATS_SOCK_GET_ERROR);
+                return nats_setError(NATS_IO_ERROR, "send error: %d",
+                                     NATS_SOCK_GET_ERROR);
             }
             else if (ctx->useEventLoop)
             {

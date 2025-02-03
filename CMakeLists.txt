@@ -36,7 +36,6 @@ SET(LIB_SOURCE_FILES
         src/glib/glib_dispatch_pool.c
         src/glib/glib_gc.c
         src/glib/glib_last_error.c
-        src/glib/glib_ssl.c
         src/glib/glib_timer.c)
 
 set(LIB_WIN_SOURCE_FILES

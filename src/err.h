@@ -19,8 +19,6 @@
 #include "nats.h"
 #include "natsp.h"
 
-#define NATS_SSL_ERR_REASON_STRING ERR_reason_error_string(ERR_get_error())
-
 #define nats_setDefaultError(e) nats_setError((e), "%s", natsStatus_GetText(e))
 
 #define nats_setError(e, f, ...) nats_setErrorReal(__FILE__, __NATS_FUNCTION__, __LINE__, (e), (f), __VA_ARGS__)

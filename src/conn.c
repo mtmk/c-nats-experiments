@@ -196,8 +196,6 @@ _freeConn(natsConnection *nc)
     natsThread_Destroy(nc->flusherThread);
     natsHash_Destroy(nc->subs);
     natsOptions_Destroy(nc->opts);
-    if (nc->sockCtx.ssl != NULL)
-        SSL_free(nc->sockCtx.ssl);
     NATS_FREE(nc->el.buffer);
     natsConn_destroyRespPool(nc);
     natsInbox_Destroy(nc->respSub);
@@ -623,168 +621,6 @@ natsConn_processAsyncINFO(natsConnection *nc, char *buf, int len)
     natsConn_Unlock(nc);
 }
 
-#if defined(NATS_HAS_TLS)
-static int
-_collectSSLErr(int preverifyOk, X509_STORE_CTX* ctx)
-{
-    SSL             *ssl  = NULL;
-    X509            *cert = X509_STORE_CTX_get_current_cert(ctx);
-    int             depth = X509_STORE_CTX_get_error_depth(ctx);
-    int             err   = X509_STORE_CTX_get_error(ctx);
-    natsConnection  *nc   = NULL;
-
-    // Retrieve the SSL object, then our connection...
-    ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
-    nc = (natsConnection*) SSL_get_ex_data(ssl, 0);
-
-    // Should we skip serve certificate verification?
-    if (nc->opts->sslCtx->skipVerify)
-        return 1;
-
-    if (!preverifyOk)
-    {
-        char certName[256]= {0};
-
-        X509_NAME_oneline(X509_get_subject_name(cert), certName, sizeof(certName));
-
-        if (err == X509_V_ERR_HOSTNAME_MISMATCH)
-        {
-            snprintf_truncate(nc->errStr, sizeof(nc->errStr), "%d:%s:expected=%s:cert=%s",
-                              err, X509_verify_cert_error_string(err), nc->tlsName,
-                              certName);
-        }
-        else
-        {
-            char issuer[256]  = {0};
-
-            X509_NAME_oneline(X509_get_issuer_name(cert), issuer, sizeof(issuer));
-
-            snprintf_truncate(nc->errStr, sizeof(nc->errStr), "%d:%s:depth=%d:cert=%s:issuer=%s",
-                              err, X509_verify_cert_error_string(err), depth,
-                              certName, issuer);
-        }
-    }
-
-    return preverifyOk;
-}
-#endif
-
-// makeTLSConn will wrap an existing Conn using TLS
-static natsStatus
-_makeTLSConn(natsConnection *nc)
-{
-#if defined(NATS_HAS_TLS)
-    natsStatus  s       = NATS_OK;
-    SSL         *ssl    = NULL;
-
-    // Reset nc->errStr before initiating the handshake...
-    nc->errStr[0] = '\0';
-
-    natsMutex_Lock(nc->opts->sslCtx->lock);
-
-    s = natsSock_SetBlocking(nc->sockCtx.fd, true);
-    if (s == NATS_OK)
-    {
-        ssl = SSL_new(nc->opts->sslCtx->ctx);
-        if (ssl == NULL)
-        {
-            s = nats_setError(NATS_SSL_ERROR,
-                              "Error creating SSL object: %s",
-                              NATS_SSL_ERR_REASON_STRING);
-        }
-        else
-        {
-            nats_sslRegisterThreadForCleanup();
-
-            SSL_set_ex_data(ssl, 0, (void*) nc);
-        }
-    }
-    if (s == NATS_OK)
-    {
-        SSL_set_connect_state(ssl);
-
-        if (SSL_set_fd(ssl, (int) nc->sockCtx.fd) != 1)
-        {
-            s = nats_setError(NATS_SSL_ERROR,
-                              "Error connecting the SSL object to a file descriptor : %s",
-                              NATS_SSL_ERR_REASON_STRING);
-        }
-    }
-    if (s == NATS_OK)
-    {
-        if (nc->opts->sslCtx->skipVerify)
-        {
-            SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
-        }
-        else
-        {
-            nc->tlsName = NULL;
-
-            // If we don't force hostname verification, perform it only
-            // if expectedHostname is set (to be backward compatible with
-            // releases prior to 2.0.0)
-            if (nc->opts->sslCtx->expectedHostname != NULL)
-                nc->tlsName = nc->opts->sslCtx->expectedHostname;
-#if defined(NATS_FORCE_HOST_VERIFICATION)
-            else if (nc->cur->tlsName != NULL)
-                nc->tlsName = nc->cur->tlsName;
-            else
-                nc->tlsName = nc->cur->url->host;
-#endif
-            if (nc->tlsName != NULL)
-            {
-#if defined(NATS_USE_OPENSSL_1_1)
-                SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-                if (!SSL_set1_host(ssl, nc->tlsName))
-#else
-                X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
-                X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-                if (!X509_VERIFY_PARAM_set1_host(param, nc->tlsName, 0))
-#endif
-                    s = nats_setError(NATS_SSL_ERROR, "unable to set expected hostname '%s'", nc->tlsName);
-            }
-            if (s == NATS_OK)
-                SSL_set_verify(ssl, SSL_VERIFY_PEER, _collectSSLErr);
-        }
-    }
-#if defined(NATS_USE_OPENSSL_1_1)
-    // add the host name in the SNI extension
-    if ((s == NATS_OK) && (nc->cur != NULL) && (!SSL_set_tlsext_host_name(ssl, nc->cur->url->host)))
-    {
-        s = nats_setError(NATS_SSL_ERROR, "unable to set SNI extension for hostname '%s'", nc->cur->url->host);
-    }
-#endif
-    if ((s == NATS_OK) && (SSL_do_handshake(ssl) != 1))
-    {
-        s = nats_setError(NATS_SSL_ERROR,
-                          "SSL handshake error: %s",
-                          (nc->errStr[0] != '\0' ? nc->errStr : NATS_SSL_ERR_REASON_STRING));
-    }
-    // Make sure that if nc-errStr was set in _collectSSLErr but
-    // the overall handshake is ok, then we clear the error
-    if (s == NATS_OK)
-    {
-        nc->errStr[0] = '\0';
-        s = natsSock_SetBlocking(nc->sockCtx.fd, false);
-    }
-
-    natsMutex_Unlock(nc->opts->sslCtx->lock);
-
-    if (s != NATS_OK)
-    {
-        if (ssl != NULL)
-            SSL_free(ssl);
-    }
-    else
-    {
-        nc->sockCtx.ssl = ssl;
-    }
-
-    return NATS_UPDATE_ERR_STACK(s);
-#else
-    return nats_setError(NATS_ILLEGAL_STATE, "%s", NO_SSL_ERR);
-#endif
-}
 
 // This will check to see if the connection should be
 // secure. This can be dictated from either end and should
@@ -800,7 +636,7 @@ _checkForSecure(natsConnection *nc)
     else if (nc->info.tlsRequired && !nc->opts->secure)
     {
         // Switch to Secure since server needs TLS.
-        s = natsOptions_SetSecure(nc->opts, true);
+        printf("TLS_ERROR(3)\n");
     }
 
     if ((s == NATS_OK) && nc->opts->secure)
@@ -808,7 +644,7 @@ _checkForSecure(natsConnection *nc)
         // If TLS handshake first is true, we have already done
         // the handshake, so do it only if false.
         if (!nc->opts->tlsHandshakeFirst)
-            s = _makeTLSConn(nc);
+            printf("TLS_ERROR(1)\n");
     }
 
     return NATS_UPDATE_ERR_STACK(s);
@@ -1527,16 +1363,6 @@ _clearPendingRequestCalls(natsConnection *nc, natsStatus reason)
     natsStrHashIter_Done(&iter);
 }
 
-static void
-_clearSSL(natsConnection *nc)
-{
-    if (nc->sockCtx.ssl == NULL)
-        return;
-
-    SSL_free(nc->sockCtx.ssl);
-    nc->sockCtx.ssl = NULL;
-}
-
 // Try to reconnect using the option parameters.
 // This function assumes we are allowed to reconnect.
 static void
@@ -1589,11 +1415,6 @@ _doReconnect(void *arg)
     if (crd == NULL)
     {
         jitter = nc->opts->reconnectJitter;
-        // TODO: since we sleep only after the whole list has been tried, we can't
-        // rely on individual *natsSrv to know if it is a TLS or non-TLS url.
-        // We have to pick which type of jitter to use, for now, we use these hints:
-        if (nc->opts->secure || (nc->opts->sslCtx != NULL))
-            jitter = nc->opts->reconnectJitterTLS;
     }
     else
         crdClosure = nc->opts->customReconnectDelayCBClosure;
@@ -1708,9 +1529,6 @@ _doReconnect(void *arg)
             // may go back to sleep and release the lock
             nc->usePending = true;
             natsBuf_Reset(nc->bw);
-
-            // We need to cleanup some things if the connection was SSL.
-            _clearSSL(nc);
 
             nc->status = NATS_CONN_STATUS_RECONNECTING;
             continue;
@@ -1974,7 +1792,7 @@ _processConnInit(natsConnection *nc)
     // If we need to have a TLS connection and want the TLS handshake to occur
     // first, do it now.
     if (nc->opts->secure && nc->opts->tlsHandshakeFirst)
-        s = _makeTLSConn(nc);
+        printf("TLS_ERROR(2)\n");
 
     // Process the INFO protocol that we should be receiving
     if (s == NATS_OK)
@@ -2208,9 +2026,6 @@ _processOpError(natsConnection *nc, natsStatus s, bool initialConnect)
             ls = _evStopPolling(nc);
             natsSock_Close(nc->sockCtx.fd);
             nc->sockCtx.fd = NATS_SOCK_INVALID;
-
-            // We need to cleanup some things if the connection was SSL.
-            _clearSSL(nc);
         }
 
         // Fail pending flush requests.
@@ -2273,9 +2088,6 @@ _readLoop(void  *arg)
     if (buffer == NULL)
         s = nats_setDefaultError(NATS_NO_MEMORY);
 
-    if (nc->sockCtx.ssl != NULL)
-        nats_sslRegisterThreadForCleanup();
-
     natsDeadline_Clear(&(nc->sockCtx.readDeadline));
 
     if (nc->ps == NULL)
@@ -2306,9 +2118,6 @@ _readLoop(void  *arg)
     natsSock_Close(nc->sockCtx.fd);
     nc->sockCtx.fd       = NATS_SOCK_INVALID;
     nc->sockCtx.fdActive = false;
-
-    // We need to cleanup some things if the connection was SSL.
-    _clearSSL(nc);
 
     natsParser_Destroy(nc->ps);
     nc->ps = NULL;
@@ -2593,9 +2402,6 @@ _close(natsConnection *nc, natsConnStatus status, bool fromPublicClose, bool doC
 
             natsSock_Close(nc->sockCtx.fd);
             nc->sockCtx.fd = NATS_SOCK_INVALID;
-
-            // We need to cleanup some things if the connection was SSL.
-            _clearSSL(nc);
         }
         else
         {

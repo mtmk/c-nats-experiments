@@ -2728,10 +2728,9 @@ natsOptions_SetReconnectWait(natsOptions *opts, int64_t reconnectWait);
  *
  * @param opts the pointer to the #natsOptions object.
  * @param jitter the jitter in milliseconds for non TLS connections.
- * @param jitterTLS the jitter in milliseconds for TLS connections.
  */
 NATS_EXTERN natsStatus
-natsOptions_SetReconnectJitter(natsOptions *opts, int64_t jitter, int64_t jitterTLS);
+natsOptions_SetReconnectJitter(natsOptions *opts, int64_t jitter);
 
 /** \brief Sets the handler to invoke when the library needs to wait before the next reconnect attempts.
  *

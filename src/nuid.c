@@ -138,20 +138,7 @@ _nextLong(int64_t *next, bool useCrypto, int64_t maxValue)
         return nats_setError(NATS_INVALID_ARG,
                              "Invalid argument for nextLong: %" PRId64 "",
                              maxValue);
-#if defined(NATS_HAS_TLS)
-    if (useCrypto)
-    {
-        int64_t r = 0;
-
-        RAND_bytes((unsigned char*) &r, sizeof(int64_t));
-        if (r < 0)
-            r = r * -1;
-
-        *next = r;
-    }
-    else
-#endif
-        *next = _rand64(maxValue);
+    *next = _rand64(maxValue);
 
     return s;
 }

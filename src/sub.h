@@ -93,7 +93,7 @@ static inline void nats_unlockReleaseSubAndDispatcher(natsSubscription *sub)
 natsStatus
 natsSub_create(natsSubscription **newSub, natsConnection *nc, const char *subj,
                const char *queueGroup, int64_t timeout, natsMsgHandler cb, void *cbClosure,
-               bool noLibDlvPool, jsSub *jsi);
+               bool noLibDlvPool);
 
 bool
 natsSub_setMax(natsSubscription *sub, uint64_t max);

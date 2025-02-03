@@ -14,8 +14,6 @@ SET(LIB_SOURCE_FILES
         src/crypto.c
         src/dispatch.c
         src/hash.c
-        src/js.c
-        src/jsm.c
         src/msg.c
         src/natstime.c
         src/nats.c

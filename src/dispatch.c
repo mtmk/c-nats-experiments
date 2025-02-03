@@ -19,7 +19,6 @@
 #include "mem.h"
 #include "conn.h"
 #include "sub.h"
-#include "js.h"
 #include "glib/glib.h"
 
 // sub and dispatcher locks must be held.
@@ -70,24 +69,6 @@ natsSub_enqueueUserMessage(natsSubscription *sub, natsMsg *msg)
     if (newBytes > sub->bytesMax)
         sub->bytesMax = newBytes;
 
-    if (sub->jsi != NULL)
-    {
-        if (sub->jsi->ackNone)
-            natsMsg_setAcked(msg);
-
-        if (sub->jsi->fetch != NULL)
-        {
-            // Just a quick check to see if this is a user message, ignore everything else.
-            bool isUserMessage = false;
-            js_checkFetchedMsg(sub, msg, 0, false, &isUserMessage);
-            if (isUserMessage)
-            {
-                sub->jsi->fetch->receivedMsgs++;
-                sub->jsi->fetch->receivedBytes += natsMsg_dataAndHdrLen(msg);
-            }
-        }
-    }
-
     // Update the subscription stats if separate, the queue stats will be
     // updated below.
     if (toQ != statsQ)
@@ -113,7 +94,7 @@ _removeHeadMsg(natsDispatcher *d, natsMsg *msg)
 // Returns fetch status, sub/dispatch locks must be held.
 static inline natsStatus
 _preProcessUserMessage(
-    natsSubscription *sub, jsSub *jsi, jsFetch *fetch, natsMsg *msg,
+    natsSubscription *sub, natsMsg *msg,
     bool *userMsg, bool *overLimit, bool *lastMessageInSub, bool *lastMessageInFetch, char **fcReply)
 {
     natsStatus fetchStatus = NATS_OK;
@@ -127,10 +108,6 @@ _preProcessUserMessage(
         sub->ownDispatcher.queue.bytes -= natsMsg_dataAndHdrLen(msg);
     }
 
-    // Fetch-specific handling of synthetic and header-only messages
-    if ((jsi != NULL) && (fetch != NULL))
-        fetchStatus = js_checkFetchedMsg(sub, msg, jsi->fetchID, true, userMsg);
-
     // Is it another kind of synthetic message?
     *userMsg = *userMsg && (msg->subject[0] != '\0');
 
@@ -143,42 +120,12 @@ _preProcessUserMessage(
             *lastMessageInSub = (sub->delivered == (sub->max - 1));
         }
 
-        if (fetch)
-        {
-            bool overMaxBytes = ((fetch->opts.MaxBytes > 0) && ((fetch->deliveredBytes) > fetch->opts.MaxBytes));
-            bool overMaxFetch = overMaxBytes;
-            *lastMessageInFetch = overMaxBytes;
-            if (fetch->opts.MaxMessages > 0)
-            {
-                overMaxFetch |= (fetch->deliveredMsgs >= fetch->opts.MaxMessages);
-                *lastMessageInFetch |= (fetch->deliveredMsgs == (fetch->opts.MaxMessages - 1));
-            }
-            // See if we want to override fetch status based on our own data.
-            if (fetchStatus == NATS_OK)
-            {
-                if (*lastMessageInFetch || overMaxFetch)
-                {
-                    fetchStatus = NATS_MAX_DELIVERED_MSGS;
-                }
-                else if (overMaxBytes)
-                {
-                    fetchStatus = NATS_LIMIT_REACHED;
-                }
-            }
-            *overLimit = (*overLimit || overMaxFetch || overMaxBytes);
-        }
-
         if (!*overLimit)
         {
             sub->delivered++;
-            if (fetch)
-            {
-                fetch->deliveredMsgs++;
-                fetch->deliveredBytes += natsMsg_dataAndHdrLen(msg);
-            }
         }
 
-        *fcReply = (jsi == NULL ? NULL : jsSub_checkForFlowControlResponse(sub));
+        *fcReply = NULL;
     }
 
     return fetchStatus;
@@ -219,8 +166,6 @@ nats_dispatchThreadPool(void *arg)
         // while under lock.
         natsSubscription    *sub                = msg->sub;
         natsConnection      *nc                 = sub->conn;
-        jsSub               *jsi                = sub->jsi;
-        jsFetch             *fetch              = (jsi != NULL) ? jsi->fetch : NULL;
         natsMsgHandler      messageCB           = sub->msgCb;
         void                *messageClosure     = sub->msgCbClosure;
         natsOnCompleteCB    completeCB          = sub->onCompleteCB;
@@ -230,7 +175,7 @@ nats_dispatchThreadPool(void *arg)
         bool                connClosed          = sub->connClosed;
 
         fetchStatus = _preProcessUserMessage(
-            sub, jsi, fetch, msg,
+            sub, msg,
             &userMsg, &overLimit, &lastMessageInSub, &lastMessageInFetch, &fcReply);
 
         // Check the timeout timer.
@@ -267,17 +212,6 @@ nats_dispatchThreadPool(void *arg)
             // Call this in case the subscription was draining.
             natsSub_setDrainCompleteState(sub);
 
-            // It's ok to access fetch->status without locking since it's only
-            // modified in this thread. completeCB and completeCBClosure are
-            // also safe to access.
-            if ((fetch != NULL) && (fetch->opts.CompleteHandler != NULL))
-            {
-                fetchStatus = fetch->status;
-                if ((fetchStatus == NATS_OK) && connClosed)
-                    fetchStatus = NATS_CONNECTION_CLOSED;
-                (*fetch->opts.CompleteHandler)(nc, sub, fetchStatus, fetch->opts.CompleteHandlerClosure);
-            }
-
             if (completeCB != NULL)
                 (*completeCB)(completeCBClosure);
 
@@ -310,12 +244,6 @@ nats_dispatchThreadPool(void *arg)
         // Fetch control messages
         else if ((fetchStatus != NATS_OK) && !lastMessageInFetch)
         {
-            // Finalize the fetch and the sub now. Need to store the fetch
-            // status, will call the user callback on close message. Override
-            // any prior (fetch request error?) value, since this is an explicit
-            // termination event.
-            fetch->status = fetchStatus;
-
             // TODO: future: options for handling missed heartbeat, for now
             // treat it as any other error and terminate.
             nats_unlockDispatcher(d);
@@ -325,14 +253,6 @@ nats_dispatchThreadPool(void *arg)
             natsSubscription_Unsubscribe(sub);
             natsMsg_Destroy(msg); // may be an actual headers-only message
             nats_lockDispatcher(d);
-            continue;
-        }
-        else if ((fetch != NULL) && (fetchStatus == NATS_OK) && !userMsg)
-        {
-            // Fetch heartbeat. Need to set the active bit to prevent the missed
-            // heartbeat condition when the timer fires.
-            jsi->active = true;
-            natsMsg_Destroy(msg);
             continue;
         }
 
@@ -364,25 +284,12 @@ nats_dispatchThreadPool(void *arg)
                 timerNeedReset = true;
         }
 
-        if (lastMessageInFetch)
-            fetch->status = fetchStatus;
-
         nats_unlockDispatcher(d);
 
         if (!overLimit)
             (*messageCB)(nc, sub, msg, messageClosure);
         else
             natsMsg_Destroy(msg);
-
-        if ((fetch != NULL) && !lastMessageInFetch && !draining)
-        {
-            fetch->status = js_maybeFetchMore(sub, fetch);
-            // If we failed to request more during a fetch, deliver whatever is
-            // already received.
-            if (fetch->status != NATS_OK)
-                natsSubscription_Drain(sub);
-        }
-
 
         if (fcReply != NULL)
         {
@@ -446,7 +353,6 @@ nats_dispatchThreadOwn(void *arg)
     void                *messageClosure     = sub->msgCbClosure;
     natsOnCompleteCB    completeCB          = NULL;
     void                *completeCBClosure  = NULL;
-    jsFetch             *fetch              = NULL;
 
     // This just serves as a barrier for the creation of this thread.
     natsConn_Lock(nc);
@@ -475,10 +381,8 @@ nats_dispatchThreadOwn(void *arg)
         bool draining = sub->draining;
         completeCB = sub->onCompleteCB;
         completeCBClosure = sub->onCompleteCBClosure;
-        jsSub *jsi = sub->jsi;
         connClosed = sub->connClosed;
         
-        fetch = (jsi != NULL) ? jsi->fetch : NULL;
         if (sub->closed)
         {
             natsSub_Unlock(sub);
@@ -504,33 +408,17 @@ nats_dispatchThreadOwn(void *arg)
 
         char *fcReply = NULL;
         natsStatus fetchStatus = _preProcessUserMessage(
-            sub, jsi, fetch, msg,
+            sub, msg,
             &userMsg, &overLimit, &lastMessageInSub, &lastMessageInFetch, &fcReply);
 
         // Fetch control messages
         if ((fetchStatus != NATS_OK) && !lastMessageInFetch)
         {
-            // We drop here only if this is not already marked as last message
-            // in fetch. The last message will be delivered first. fetch can not
-            // be NULL here since fetchStatus is set.
-            fetch->status = fetchStatus;
             natsSub_Unlock(sub);
             natsMsg_Destroy(msg); // may be an actual headers-only message
             unsub = true;
             break;
         }
-        else if ((fetch != NULL) && (fetchStatus == NATS_OK) && !userMsg)
-        {
-            // Fetch heartbeat. Need to set the active bit to prevent the missed
-            // heartbeat condition when the timer fires.
-            jsi->active = true;
-            natsSub_Unlock(sub);
-            natsMsg_Destroy(msg);
-            continue;
-        }
-
-        if (lastMessageInFetch)
-            fetch->status = fetchStatus;
 
         natsSub_Unlock(sub);
 
@@ -538,15 +426,6 @@ nats_dispatchThreadOwn(void *arg)
             (*messageCB)(nc, sub, msg, messageClosure);
         else
             natsMsg_Destroy(msg);
-
-        if ((fetch != NULL) && !lastMessageInFetch && !draining)
-        {
-            fetch->status = js_maybeFetchMore(sub, fetch);
-            // If we failed to request more during a fetch, deliver whatever is
-            // already received.
-            if (fetch->status != NATS_OK)
-                natsSubscription_Drain(sub);
-        }
 
         if (fcReply != NULL)
         {
@@ -574,16 +453,6 @@ nats_dispatchThreadOwn(void *arg)
         natsSubscription_Unsubscribe(sub);
     else if (rmSub)
         natsConn_removeSubscription(nc, sub);
-
-    // It's ok to access fetch->status without locking since it's only modified
-    // in this thread. completeCB and completeCBClosure are also safe to access.
-    if ((fetch != NULL) && (fetch->opts.CompleteHandler != NULL))
-    {
-        natsStatus fetchStatus = fetch->status;
-        if ((fetchStatus == NATS_OK) && connClosed)
-            fetchStatus = NATS_CONNECTION_CLOSED;
-        (*fetch->opts.CompleteHandler)(nc, sub, fetchStatus, fetch->opts.CompleteHandlerClosure);
-    }
 
     if (completeCB != NULL)
         (*completeCB)(completeCBClosure);

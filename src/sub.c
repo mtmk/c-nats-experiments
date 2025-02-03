@@ -21,7 +21,6 @@
 #include "sub.h"
 #include "msg.h"
 #include "util.h"
-#include "js.h"
 #include "opts.h"
 #include "glib/glib.h"
 
@@ -119,7 +118,6 @@ _freeSub(natsSubscription *sub)
     natsCondition_Destroy(sub->drainCond);
     natsTimer_Destroy(sub->timeoutTimer);
     natsMutex_Destroy(sub->mu);
-    jsSub_free(sub->jsi);
 
     natsConn_release(sub->conn);
 
@@ -165,20 +163,6 @@ _setDrainCompleteState(natsSubscription *sub)
     // switched to "drain complete", swith the state.
     if (!natsSub_drainComplete(sub))
     {
-        // For JS subscription we may need to delete the JS consumer, but
-        // we want to do so here ONLY if there was really a drain started.
-        // So need to check on drain started state. Also, note that if
-        // jsSub_deleteConsumerAfterDrain is invoked, the lock may be
-        // released/reacquired in that function.
-        if ((sub->jsi != NULL) && natsSub_drainStarted(sub) && sub->jsi->dc)
-        {
-            jsSub_deleteConsumerAfterDrain(sub);
-            // Check drainCompete state again, since another thread may have
-            // beat us to it while lock was released.
-            if (natsSub_drainComplete(sub))
-                return;
-        }
-
         // If drain status is not already set (could be done in _flushAndDrain
         // if flush fails, or timeout occurs), set it here to report if the
         // connection or subscription has been closed prior to drain completion.
@@ -255,14 +239,6 @@ void natsSub_close(natsSubscription *sub, bool connectionClosed)
     {
         sub->closed = true;
         sub->connClosed = connectionClosed;
-
-        if (sub->jsi != NULL)
-        {
-            if (sub->jsi->hbTimer != NULL)
-                natsTimer_Stop(sub->jsi->hbTimer);
-            if ((sub->jsi->fetch != NULL) && (sub->jsi->fetch->expiresTimer != NULL))
-                natsTimer_Stop(sub->jsi->fetch->expiresTimer);
-        }
 
         // If this is a subscription with timeout, stop the timer.
         if (sub->timeout != 0)
@@ -344,7 +320,7 @@ natsStatus nats_createControlMessages(natsSubscription *sub)
 natsStatus
 natsSub_create(natsSubscription **newSub, natsConnection *nc, const char *subj,
                const char *queueGroup, int64_t timeout, natsMsgHandler cb, void *cbClosure,
-               bool forReplies, jsSub *jsi)
+               bool forReplies)
 {
     natsStatus s = NATS_OK;
     natsSubscription *sub = NULL;
@@ -369,7 +345,6 @@ natsSub_create(natsSubscription **newSub, natsConnection *nc, const char *subj,
     sub->msgCbClosure   = cbClosure;
     sub->msgsLimit      = nc->opts->maxPendingMsgs;
     sub->bytesLimit     = nc->opts->maxPendingBytes == -1 ? nc->opts->maxPendingMsgs * 1024 : (int)nc->opts->maxPendingBytes;;
-    sub->jsi            = jsi;
 
     sub->subject = NATS_STRDUP(subj);
     if (sub->subject == NULL)
@@ -572,7 +547,6 @@ natsSub_nextMsg(natsMsg **nextMsg, natsSubscription *sub, int64_t timeout, bool 
     natsMsg *msg = NULL;
     bool removeSub = false;
     int64_t target = 0;
-    jsSub *jsi = NULL;
     char *fcReply = NULL;
 
     if ((sub == NULL) || (nextMsg == NULL))
@@ -610,24 +584,8 @@ natsSub_nextMsg(natsMsg **nextMsg, natsSubscription *sub, int64_t timeout, bool 
 
         return nats_setDefaultError(NATS_SLOW_CONSUMER);
     }
-    if (sub->jsi != NULL)
-    {
-        if (sub->jsi->sm)
-        {
-            sub->jsi->sm = false;
-            natsSub_Unlock(sub);
-
-            return nats_setError(NATS_MISMATCH, "%s", jsErrConsumerSeqMismatch);
-        }
-        else if (!pullSubInternal && sub->jsi->pull)
-        {
-            natsSub_Unlock(sub);
-            return nats_setError(NATS_INVALID_SUBSCRIPTION, "%s", jsErrNotApplicableToPullSub);
-        }
-    }
 
     nc = sub->conn;
-    jsi = sub->jsi;
 
     if (timeout > 0)
     {
@@ -674,7 +632,7 @@ natsSub_nextMsg(natsMsg **nextMsg, natsSubscription *sub, int64_t timeout, bool 
             msg->next = NULL;
 
             sub->delivered++;
-            fcReply = (jsi == NULL ? NULL : jsSub_checkForFlowControlResponse(sub));
+            fcReply = NULL;
 
             if (sub->max > 0)
             {
@@ -737,7 +695,6 @@ _unsubscribe(natsSubscription *sub, int max, bool drainMode, int64_t timeout)
     natsStatus s = NATS_OK;
     natsConnection *nc = NULL;
     bool dc = false;
-    jsSub *jsi;
 
     if (sub == NULL)
         return nats_setDefaultError(NATS_INVALID_ARG);
@@ -746,25 +703,9 @@ _unsubscribe(natsSubscription *sub, int max, bool drainMode, int64_t timeout)
     nc = sub->conn;
     _retain(sub);
 
-    if ((max == 0) && (jsi = sub->jsi) != NULL)
-    {
-        if (jsi->hbTimer != NULL)
-            natsTimer_Stop(jsi->hbTimer);
-        if ((jsi->fetch != NULL) && (jsi->fetch->expiresTimer != NULL))
-            natsTimer_Stop(jsi->fetch->expiresTimer);
-
-        dc = jsi->dc;
-    }
-
     natsSub_Unlock(sub);
 
     s = natsConn_unsubscribe(nc, sub, max, drainMode, timeout);
-
-    // If user calls natsSubscription_Unsubscribe() and this
-    // is a JS subscription that is supposed to delete the JS
-    // consumer, do so now.
-    if ((s == NATS_OK) && (max == 0) && !drainMode && dc)
-        s = jsSub_deleteConsumer(sub);
 
     natsSub_release(sub);
 
@@ -991,7 +932,7 @@ natsSubscription_WaitForDrainCompletion(natsSubscription *sub, int64_t timeout)
     }
     _retain(sub);
 
-    dc = (sub->jsi != NULL ? sub->jsi->dc : false);
+    dc = false;
 
     if (timeout > 0)
         deadline = nats_setTargetTime(timeout);
@@ -1004,9 +945,6 @@ natsSubscription_WaitForDrainCompletion(natsSubscription *sub, int64_t timeout)
             natsCondition_Wait(sub->drainCond, sub->mu);
     }
     natsSub_Unlock(sub);
-
-    if ((s == NATS_OK) && dc)
-        s = jsSub_deleteConsumer(sub);
 
     natsSub_release(sub);
 
@@ -1348,11 +1286,6 @@ void natsSubscription_Destroy(natsSubscription *sub)
     // we can suppress the UNSUB protocol.
     if (doUnsub && (sub->max > 0))
         doUnsub = sub->delivered < sub->max;
-
-    // For a JetStream subscription, disable the "delete consumer" flag
-    // because we auto-delete only on explicit calls to unsub/drain.
-    if (sub->jsi != NULL)
-        sub->jsi->dc = false;
 
     natsSub_Unlock(sub);
 

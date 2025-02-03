@@ -34,7 +34,6 @@
 #include "comsock.h"
 #include "nkeys.h"
 #include "crypto.h"
-#include "js.h"
 #include "glib/glib.h"
 
 #define DEFAULT_SCRATCH_SIZE    (512)
@@ -996,15 +995,7 @@ _resendSubscriptions(natsConnection *nc)
 
         adjustedMax = 0;
         nats_lockSubAndDispatcher(sub);
-        // If JS ordered consumer, trigger a reset. Don't check the error
-        // condition here. If there is a failure, it will be retried
-        // at the next HB interval.
-        if ((sub->jsi != NULL) && (sub->jsi->ordered))
-        {
-            jsSub_resetOrderedConsumer(sub, sub->jsi->sseq+1);
-            nats_unlockSubAndDispatcher(sub);
-            continue;
-        }
+
         if (natsSub_drainStarted(sub))
         {
             nats_unlockSubAndDispatcher(sub);
@@ -2484,8 +2475,6 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
     natsMsg          *msg = NULL;
     bool             sc   = false;
     bool             sm   = false;
-    // For JetStream cases
-    jsSub            *jsi    = NULL;
     bool             ctrlMsg = false;
     const char       *fcReply= NULL;
     int              jct     = 0;
@@ -2540,43 +2529,12 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
         return NATS_OK;
     }
 
-    jsi = sub->jsi;
-    // For JS subscriptions (but not pull ones), handle hearbeat and flow control here.
-    if (jsi && !jsi->pull)
-    {
-        ctrlMsg = natsMsg_isJSCtrl(msg, &jct);
-        if (ctrlMsg && jct == jsCtrlHeartbeat)
-        {
-            // Check if the hearbeat has a "Consumer Stalled" header, if
-            // so, the value is the FC reply to send a nil message to.
-            // We will send it at the end of this function.
-            natsMsgHeader_Get(msg, jsConsumerStalledHdr, &fcReply);
-        }
-        else if (!ctrlMsg && jsi->ordered)
-        {
-            bool replaced = false;
-
-            s = jsSub_checkOrderedMsg(sub, msg, &replaced);
-            if ((s != NATS_OK) || replaced)
-            {
-                nats_unlockReleaseSubAndDispatcher(sub);
-                natsMsg_Destroy(msg);
-                return s;
-            }
-        }
-    }
-
     if (!ctrlMsg)
     {
         s = natsSub_enqueueUserMessage(sub, msg);
         if (s == NATS_OK)
         {
             sub->slowConsumer = false;
-
-            // Store the ACK metadata from the message to
-            // compare later on with the received heartbeat.
-            if (jsi != NULL)
-                s = jsSub_trackSequences(jsi, msg->reply);
         }
         else
         {
@@ -2588,25 +2546,6 @@ natsConn_processMsg(natsConnection *nc, char *buf, int bufLen)
             sub->slowConsumer = true;
 
             s = NATS_OK;
-        }
-    }
-    else if ((jct == jsCtrlHeartbeat) && (msg->reply == NULL))
-    {
-        // Handle control heartbeat messages.
-        s = jsSub_processSequenceMismatch(sub, msg, &sm);
-    }
-    else if ((jct == jsCtrlFlowControl) && (msg->reply != NULL))
-    {
-        // We will schedule the send of the FC reply once we have delivered the
-		// DATA message that was received before this flow control message, which
-		// has sequence `jsi.fciseq`. However, it is possible that this message
-		// has already been delivered, in that case, we need to send the FC reply now.
-        if (sub->delivered >= jsi->fciseq)
-            fcReply = msg->reply;
-        else
-        {
-            // Schedule a reply after the previous message is delivered.
-            s = jsSub_scheduleFlowControlResponse(jsi, msg->reply);
         }
     }
 
@@ -2831,7 +2770,7 @@ natsStatus
 natsConn_subscribeImpl(natsSubscription **newSub,
                        natsConnection *nc, bool lock, const char *subj, const char *queue,
                        int64_t timeout, natsMsgHandler cb, void *cbClosure,
-                       bool preventUseOfLibDlvPool, jsSub *jsi)
+                       bool preventUseOfLibDlvPool)
 {
     natsStatus          s    = NATS_OK;
     natsSubscription    *sub = NULL;
@@ -2864,7 +2803,7 @@ natsConn_subscribeImpl(natsSubscription **newSub,
         return nats_setDefaultError(NATS_DRAINING);
     }
 
-    s = natsSub_create(&sub, nc, subj, queue, timeout, cb, cbClosure, preventUseOfLibDlvPool, jsi);
+    s = natsSub_create(&sub, nc, subj, queue, timeout, cb, cbClosure, preventUseOfLibDlvPool);
     if (s == NATS_OK)
     {
         natsMutex_Lock(nc->subsMu);
@@ -4269,10 +4208,7 @@ natsConn_defaultErrHandler(natsConnection *nc, natsSubscription *sub, natsStatus
         char *subject = NULL;
 
         natsSub_Lock(sub);
-        if ((sub->jsi != NULL) && (sub->jsi->psubj != NULL))
-            subject = sub->jsi->psubj;
-        else
-            subject = sub->subject;
+        subject = sub->subject;
         fprintf(stderr, "Error %d - %s on connection [%" PRIu64 "] on \"%s\"\n", err, errTxt, cid, subject);
         natsSub_Unlock(sub);
     }
